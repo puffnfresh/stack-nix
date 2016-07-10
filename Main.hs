@@ -18,20 +18,41 @@ import Stack.Options
 import Stack.PackageDump
 import Stack.Setup
 import Stack.Types.Build
+import Stack.Types.BuildPlan
+import Stack.Types.Compiler
 import Stack.Types.Config
 import Stack.Types.GhcPkgId
 import Stack.Types.Package
 import Stack.Types.PackageIdentifier
+import Stack.Types.PackageName
 import Stack.Types.StackT
+import Stack.Types.Version
 import System.Environment
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
-derivationFromTaskType :: TaskType -> Maybe String
-derivationFromTaskType (TTUpstream p _ _) =
-  Just $ "(callHackage \"" ++ show (packageName p) ++ "\" \"" ++ show (packageVersion p) ++ "\" { })"
-derivationFromTaskType _ =
+data StackNixPackage
+  = StackNixPackage { stackNixPackageName :: PackageName
+                    , stackNixPackageVersion :: Version
+                    }
+
+stackNixPackageFromTaskType :: TaskType -> Maybe StackNixPackage
+stackNixPackageFromTaskType (TTUpstream p _ _) =
+  Just $ StackNixPackage (packageName p) (packageVersion p)
+stackNixPackageFromTaskType _ =
   Nothing
+
+stackNixPackageDerivation :: StackNixPackage -> String
+stackNixPackageDerivation p =
+  "(callHackage \"" ++ show (stackNixPackageName p) ++ "\" \"" ++ show (stackNixPackageVersion p) ++ "\" { })"
+
+resolverAttribute :: LoadedResolver -> String
+resolverAttribute (ResolverSnapshot (LTS a i)) =
+  "lts-" ++ show a ++ "_" ++ show i
+resolverAttribute (ResolverCompiler (GhcVersion v)) =
+  "ghc" ++ filter (/= '.') (versionString v)
+resolverAttribute _ =
+  "ghc801"
 
 flagCacheFile :: (MonadIO m, MonadThrow m, MonadReader env m, HasEnvConfig env)
               => Installed
@@ -85,6 +106,13 @@ main = do
 
       traverse_ writePretendFlags $ planTasks plan
 
-      let nixPackages = unwords . catMaybes . fmap (derivationFromTaskType . taskType) . Map.elems $ planTasks plan
-      -- TODO: Use approprate resolver
-      liftIO . putStrLn $ "haskell.packages.lts-6_0.ghcWithPackages (p: with p; [ " ++ nixPackages ++ " ])"
+      let packageNixPackages = catMaybes . fmap (stackNixPackageFromTaskType . taskType) . Map.elems $ planTasks plan
+
+      liftIO $ putStrLn "with import <nixpkgs> { };"
+      liftIO $ putStrLn "runCommand \"true\" {"
+      liftIO . putStrLn $ "  buildInputs = [ stack (haskell.packages." ++ resolverAttribute (bcResolver bconfig) ++ ".ghcWithPackages (p: with p; [ " ++ unwords (stackNixPackageDerivation <$> packageNixPackages) ++ " ])) ];"
+      liftIO $ putStrLn "  registerStackPackages = ''"
+      forM_ packageNixPackages $ \p ->
+        liftIO . putStrLn $ "    ghc-pkg describe " ++ show (stackNixPackageName p) ++ " | GHC_PACKAGE_PATH=$(stack path --local-pkg-db) ghc-pkg register --force -"
+      liftIO $ putStrLn "  '';"
+      liftIO $ putStrLn "} \"\""
